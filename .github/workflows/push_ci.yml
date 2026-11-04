@@ -9,8 +9,6 @@ on:
       - 'renovate.json'
       - '.editorconfig'
       - '.gitignore'
-      - '.github/**'
-      - '.github/workflows/**'
       - '.idea/**'
   pull_request:
     branches: [ main ]
@@ -20,8 +18,6 @@ on:
       - 'renovate.json'
       - '.editorconfig'
       - '.gitignore'
-      - '.github/**'
-      - '.github/workflows/**'
       - '.idea/**'
   workflow_dispatch:
 
@@ -29,7 +25,7 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
-    if: ${{ !startsWith(github.event.head_commit.message, '[skip ci]') && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request') }}
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, '[ci skip]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -47,8 +43,8 @@ jobs:
       - name: Grant execute permission
         run: chmod +x gradlew
 
-      - name: Decode keystore (push -> main)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Decode keystore
+        if: github.event_name != 'pull_request'
         run: |
           mkdir -p app
           echo "$KEYSTORE_B64" | base64 -d > app/ono.jks
@@ -59,8 +55,8 @@ jobs:
         if: github.event_name == 'pull_request'
         run: ./gradlew assembleRelease --warning-mode all --stacktrace
 
-      - name: Build signed Release for main
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Build signed Release
+        if: github.event_name != 'pull_request'
         run: |
           ./gradlew assembleRelease \
             -PKEYSTORE_FILE=ono.jks \
@@ -76,64 +72,13 @@ jobs:
           name: ono-pr-apk
           path: app/build/outputs/apk/release/**/*.apk
           if-no-files-found: error
+          retention-days: 30
 
       - name: Upload Release APK (signed)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: ono-release-apk
           path: app/build/outputs/apk/release/**/*.apk
           if-no-files-found: error
-
-  publish-release:
-    name: Publish GitHub Release
-    needs: build
-    runs-on: ubuntu-latest
-    if: ${{ success() && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
-    permissions:
-      contents: write
-    steps:
-      - name: Download APK artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: ono-release-apk
-          path: artifacts
-
-      - name: Collect APK
-        shell: bash
-        run: |
-          shopt -s nullglob
-          files=(artifacts/**/*.apk artifacts/*.apk)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "No APK found!" >&2
-            exit 1
-          fi
-          mkdir -p out
-          cp "${files[0]}" out/ONO-release.apk
-          ls -lh out
-
-      - name: Write notes
-        env:
-          COMMIT_MSG: ${{ github.event.head_commit.message }}
-        run: |
-          {
-            echo "自动构建 · \`${GITHUB_SHA::7}\`"
-            echo
-            echo '```'
-            echo "$COMMIT_MSG"
-            echo '```'
-            echo
-            echo "**SHA256**"
-            echo '```'
-            sha256sum out/ONO-release.apk | awk '{print $1}'
-            echo '```'
-          } > notes.md
-
-      - name: Publish
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: nightly
-          name: Nightly ${{ github.sha }}
-          prerelease: true
-          files: out/ONO-release.apk
-          body_path: notes.md
+          retention-days: 30
