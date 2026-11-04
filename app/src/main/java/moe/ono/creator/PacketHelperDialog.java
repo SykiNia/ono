@@ -33,6 +33,7 @@ import android.text.Editable;
 import android.text.Spannable;
 import android.text.SpannableString;
 import android.text.TextWatcher;
+import android.text.method.DigitsKeyListener;
 import android.text.style.ForegroundColorSpan;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -53,6 +54,7 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import com.google.android.material.dialog.MaterialAlertDialogBuilder;
+import com.google.android.material.checkbox.MaterialCheckBox;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
@@ -71,6 +73,7 @@ import org.xmlpull.v1.XmlPullParserFactory;
 
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -127,6 +130,20 @@ public class PacketHelperDialog extends BottomPopupView {
     private static String originalPbContent = "";
     public static RadioGroup mRgSendBy;
     public static CheckBox mRbXmlForward;
+    private static RadioGroup mRgTextSendBy;   // text 的发送方式（direct / file）
+    private static LinearLayout textFileConfig; // file 模式的配置区
+    private static EditText etFilePath;         // 文件路径
+    private static EditText etFileDelay;        // 每行之间的延迟 (ms)
+    private static MaterialCheckBox cbFileLoop; // 是否循环
+    private static TextView tvFileProgress;     // 当前进度
+    private static Button btnFileStop;          // 终止当前任务
+
+    private final Handler fileTaskHandler = new Handler(Looper.getMainLooper()); // 文件发包用的 Handler
+    private final List<String> fileLines = new ArrayList<>(); // 文件内容按行缓存
+    private int fileTaskIndex = 0;  // 发到第几行
+    private boolean fileTaskRunning = false; // 任务是否在跑
+    private long fileTaskDelay = 0; // 当前任务的发包间隔
+    private boolean fileTaskLoop = false; // 当前任务是否循环
 
 
 
@@ -198,6 +215,17 @@ public class PacketHelperDialog extends BottomPopupView {
 
             mRbXmlForward = findViewById(R.id.xml_forward);
 
+            mRgTextSendBy = findViewById(R.id.rg_text_send_by);
+            textFileConfig = findViewById(R.id.text_file_config);
+            etFilePath = findViewById(R.id.file_path);
+            etFileDelay = findViewById(R.id.file_delay);
+            cbFileLoop = findViewById(R.id.cb_file_loop);
+            tvFileProgress = findViewById(R.id.tv_file_progress);
+            btnFileStop = findViewById(R.id.btn_file_stop);
+
+            // 延迟只让填数字
+            etFileDelay.setKeyListener(DigitsKeyListener.getInstance("0123456789"));
+
             try {
                 mRgSendType.check(R.id.rb_element);
                 editText.setHint("Raw(array)...");
@@ -262,10 +290,18 @@ public class PacketHelperDialog extends BottomPopupView {
 
             final RadioButton[] rb = {findViewById(mRgSendType.getCheckedRadioButtonId())};
 
+            // 进来先按识别出来的类型同步一次 text 的子模式
+            applySendTypeVisibility(String.valueOf(rb[0].getText()));
+
+            mRgTextSendBy.setOnCheckedChangeListener((group, checkedId) -> applyTextSendMode());
+
+            btnFileStop.setOnClickListener(v -> stopTextFileTask(true));
+
 
             mRgSendType.setOnCheckedChangeListener((group, checkedId) -> {
                 rb[0] = findViewById(mRgSendType.getCheckedRadioButtonId());
                 String send_type = rb[0].getText().toString();
+                applySendTypeVisibility(send_type); // 切类型时同步 text 的 direct / file
                 switch (send_type){
                     case "element":
                         editText.setHint("Raw(array)...");
@@ -303,6 +339,12 @@ public class PacketHelperDialog extends BottomPopupView {
                 String text = editText.getText().toString();
                 String send_type = rb[0].getText().toString();
                 ContactCompat contactCompat = getContact();
+
+                // text 的 file 模式：不走大输入框，点发送就是开始读文件逐行发包
+                if (send_type.equals("text") && mRgTextSendBy.getCheckedRadioButtonId() == R.id.rb_text_file) {
+                    startTextFileTask();
+                    return;
+                }
 
                 if (text.isEmpty()){
                     Toasts.info(getContext(), "你什么都没输入呢");
@@ -481,6 +523,10 @@ public class PacketHelperDialog extends BottomPopupView {
             });
 
             btnSend.setOnLongClickListener(v -> {
+                // file 模式长按没有重复发包的意义，直接跳过
+                if ("text".equals(rb[0].getText().toString()) && mRgTextSendBy.getCheckedRadioButtonId() == R.id.rb_text_file) {
+                    return true;
+                }
                 String send_type = rb[0].getText().toString();
                 String text = editText.getText().toString();
                 ContactCompat contactCompat = getContact();
@@ -756,6 +802,140 @@ public class PacketHelperDialog extends BottomPopupView {
         MsgElement msgElement = nt_build_text(text);
         elements.add(msgElement);
         Nt_kernel_bridge.send_msg(contactCompat, elements);
+    }
+
+    /**
+     * 根据发送类型，控制 text 子模式（direct / file）与 file 配置区的显示
+     */
+    private void applySendTypeVisibility(String send_type) {
+        mRgTextSendBy.setVisibility(send_type.equals("text") ? VISIBLE : GONE);
+        if (send_type.equals("text")) {
+            applyTextSendMode();
+        } else {
+            textFileConfig.setVisibility(GONE);
+            editText.setVisibility(VISIBLE);
+        }
+    }
+
+    /**
+     * text 的 direct 模式用大输入框，file 模式收起大输入框换成文件配置
+     */
+    private void applyTextSendMode() {
+        if (mRgTextSendBy.getCheckedRadioButtonId() == R.id.rb_text_file) {
+            editText.setVisibility(GONE);
+            textFileConfig.setVisibility(VISIBLE);
+        } else {
+            editText.setVisibility(VISIBLE);
+            textFileConfig.setVisibility(GONE);
+        }
+    }
+
+    /**
+     * 读取文件，按行依次发包，间隔由延迟输入框控制
+     */
+    private void startTextFileTask() {
+        String path = etFilePath.getText().toString().trim();
+        String delayStr = etFileDelay.getText().toString().trim();
+
+        if (path.isEmpty()) {
+            Toasts.info(getContext(), "你什么都没输入呢");
+            return;
+        }
+
+        long delay;
+        try {
+            delay = Long.parseLong(delayStr);
+        } catch (NumberFormatException e) {
+            Toasts.error(getContext(), "延迟只能填数字");
+            return;
+        }
+
+        if (delay <= 0) {
+            Toasts.error(getContext(), "延迟要大于 0");
+            return;
+        }
+
+        // 已经在跑的话先把上一次的停掉
+        stopTextFileTask(false);
+
+        fileLines.clear();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(path), "UTF-8"))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.trim().isEmpty()) continue; // 空行跳过
+                fileLines.add(line);
+            }
+        } catch (Exception e) {
+            Logger.e("读取文件失败", e);
+            Toasts.info(getContext(), "找不到文件哦");
+            return;
+        }
+
+        if (fileLines.isEmpty()) {
+            Toasts.info(getContext(), "文件是空的哦");
+            return;
+        }
+
+        fileTaskIndex = 0;
+        fileTaskDelay = delay;
+        fileTaskLoop = cbFileLoop.isChecked();
+        fileTaskRunning = true;
+
+        tvFileProgress.setText("进度: 0/" + fileLines.size());
+        Toasts.success(getContext(), "开始发包");
+
+        fileTaskHandler.post(fileTaskRunnable);
+    }
+
+    /**
+     * 按行发包的循环体，发完一行再按延迟排下一行
+     */
+    private final Runnable fileTaskRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!fileTaskRunning) return;
+
+            try {
+                send_text_msg(fileLines.get(fileTaskIndex), contactCompat);
+                fileTaskIndex++;
+                tvFileProgress.setText("进度: " + fileTaskIndex + "/" + fileLines.size());
+            } catch (Exception e) {
+                Logger.e("发包失败", e);
+                Toasts.error(getContext(), "发包失败");
+                stopTextFileTask(true);
+                return;
+            }
+
+            if (fileTaskIndex < fileLines.size()) {
+                fileTaskHandler.postDelayed(this, fileTaskDelay);
+            } else if (fileTaskLoop) {
+                fileTaskIndex = 0; // 循环模式，发完一轮从头再来
+                tvFileProgress.setText("进度: 0/" + fileLines.size());
+                fileTaskHandler.postDelayed(this, fileTaskDelay);
+            } else {
+                fileTaskRunning = false;
+                Toasts.success(getContext(), "发包完成");
+            }
+        }
+    };
+
+    /**
+     * 终止当前的文件发包任务
+     */
+    private void stopTextFileTask(boolean toast) {
+        if (!fileTaskRunning) {
+            if (toast) Toasts.info(getContext(), "当前没有任务");
+            return;
+        }
+
+        fileTaskRunning = false;
+        fileTaskHandler.removeCallbacks(fileTaskRunnable);
+
+        if (tvFileProgress != null) {
+            tvFileProgress.setText("进度: 已终止 (" + fileTaskIndex + "/" + fileLines.size() + ")");
+        }
+
+        if (toast) Toasts.info(getContext(), "已终止");
     }
 
     @SuppressLint("SetTextI18n")
@@ -1138,6 +1318,7 @@ public class PacketHelperDialog extends BottomPopupView {
 
     @Override
     protected void beforeDismiss() {
+        stopTextFileTask(false); // 面板关掉就把文件任务停掉
         fadeOutAndClearBlur(decorView);
         super.beforeDismiss();
     }
