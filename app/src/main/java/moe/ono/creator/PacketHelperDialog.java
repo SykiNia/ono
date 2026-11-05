@@ -884,8 +884,8 @@ public class PacketHelperDialog extends BottomPopupView {
             return;
         }
 
-        if (delay <= 0) {
-            Toasts.error(getContext(), "延迟要大于 0");
+        if (delay < 0) {
+            Toasts.error(getContext(), "延迟不能是负数");
             return;
         }
 
