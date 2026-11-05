@@ -24,6 +24,7 @@ import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.RenderEffect;
 import android.graphics.Shader;
+import android.graphics.drawable.ColorDrawable;
 import android.icu.text.SimpleDateFormat;
 import android.net.Uri;
 import android.os.Build;
@@ -35,8 +36,11 @@ import android.text.SpannableString;
 import android.text.TextWatcher;
 import android.text.method.DigitsKeyListener;
 import android.text.style.ForegroundColorSpan;
+import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.View;
+import android.view.Window;
+import android.view.WindowManager;
 import android.view.animation.AccelerateInterpolator;
 import android.view.animation.DecelerateInterpolator;
 import android.widget.Button;
@@ -135,13 +139,27 @@ public class PacketHelperDialog extends BottomPopupView {
     private static EditText etFilePath;         // 文件路径
     private static EditText etFileDelay;        // 每行之间的延迟 (ms)
     private static MaterialCheckBox cbFileLoop; // 是否循环
-    private static TextView tvFileProgress;     // 当前进度
-    private static Button btnFileStop;          // 终止当前任务
+    private static Button btnFilePath;          // 保存的路径
+    private static LinearLayout jsonToolsBar;   // 格式化 / 全屏编辑 那一行
+
+    private static Dialog path_dialog = null;   // 保存的路径的 dialog
+    private static Activity dialogActivity;     // 重新弹面板用
+    private static Context dialogContext;       // 重新弹面板用
+    private static boolean reopenFileMode = false; // 任务结束后重开面板直接回到 file 模式
+    private static String lastFilePath = "";    // 上一次的文件路径
+    private static String lastFileDelay = "1000"; // 上一次的延迟
+    private static boolean lastFileLoop = false;  // 上一次的循环状态
+
+    private final SharedPreferences pathPreferences; // 存文件路径的
+    private final List<String> presetPaths;     // 保存的文件路径
+    private Dialog taskDialog;                  // 应用内浮窗，不是系统悬浮窗
+    private TextView taskStatus;                // 浮窗里的状态
 
     private final Handler fileTaskHandler = new Handler(Looper.getMainLooper()); // 文件发包用的 Handler
     private final List<String> fileLines = new ArrayList<>(); // 文件内容按行缓存
     private int fileTaskIndex = 0;  // 发到第几行
     private boolean fileTaskRunning = false; // 任务是否在跑
+    private boolean fileTaskKeepOnDismiss = false; // 收起面板时是否保留任务
     private long fileTaskDelay = 0; // 当前任务的发包间隔
     private boolean fileTaskLoop = false; // 当前任务是否循环
 
@@ -152,10 +170,14 @@ public class PacketHelperDialog extends BottomPopupView {
         sharedPreferences = context.getSharedPreferences("OvO_Presetelems", Context.MODE_PRIVATE);
         presetelems = loadPresetElem();
         elemContentMap = loadElemContentMap();
+        pathPreferences = context.getSharedPreferences("OvO_PresetPaths", Context.MODE_PRIVATE);
+        presetPaths = loadPresetPaths();
     }
 
     public static void createView(Activity activity, Context context, String content) {
         preContent = content;
+        dialogActivity = activity;
+        dialogContext = context;
         Context fixContext = CommonContextWrapper.createAppCompatContext(context);
         XPopup.Builder NewPop = new XPopup.Builder(fixContext).moveUpToKeyboard(true).isDestroyOnDismiss(true);
         NewPop.maxHeight((int) (XPopupUtils.getScreenHeight(context) * .7f));
@@ -220,8 +242,8 @@ public class PacketHelperDialog extends BottomPopupView {
             etFilePath = findViewById(R.id.file_path);
             etFileDelay = findViewById(R.id.file_delay);
             cbFileLoop = findViewById(R.id.cb_file_loop);
-            tvFileProgress = findViewById(R.id.tv_file_progress);
-            btnFileStop = findViewById(R.id.btn_file_stop);
+            btnFilePath = findViewById(R.id.btn_file_path);
+            jsonToolsBar = findViewById(R.id.json_tools_bar);
 
             // 延迟只让填数字
             etFileDelay.setKeyListener(DigitsKeyListener.getInstance("0123456789"));
@@ -293,9 +315,23 @@ public class PacketHelperDialog extends BottomPopupView {
             // 进来先按识别出来的类型同步一次 text 的子模式
             applySendTypeVisibility(String.valueOf(rb[0].getText()));
 
+            // 任务结束后重新弹出来的面板，直接回到 file 模式并带回上次填的东西
+            if (reopenFileMode) {
+                reopenFileMode = false;
+                mRgSendType.check(R.id.rb_text);
+                rb[0] = findViewById(mRgSendType.getCheckedRadioButtonId());
+                editText.setHint("纯文本...");
+                applySendTypeVisibility("text");
+                mRgTextSendBy.check(R.id.rb_text_file);
+                applyTextSendMode();
+                etFilePath.setText(lastFilePath);
+                etFileDelay.setText(lastFileDelay);
+                cbFileLoop.setChecked(lastFileLoop);
+            }
+
             mRgTextSendBy.setOnCheckedChangeListener((group, checkedId) -> applyTextSendMode());
 
-            btnFileStop.setOnClickListener(v -> stopTextFileTask(true));
+            btnFilePath.setOnClickListener(v -> showPresetPathDialog());
 
 
             mRgSendType.setOnCheckedChangeListener((group, checkedId) -> {
@@ -814,6 +850,7 @@ public class PacketHelperDialog extends BottomPopupView {
         } else {
             textFileConfig.setVisibility(GONE);
             editText.setVisibility(VISIBLE);
+            jsonToolsBar.setVisibility(VISIBLE);
         }
     }
 
@@ -821,13 +858,10 @@ public class PacketHelperDialog extends BottomPopupView {
      * text 的 direct 模式用大输入框，file 模式收起大输入框换成文件配置
      */
     private void applyTextSendMode() {
-        if (mRgTextSendBy.getCheckedRadioButtonId() == R.id.rb_text_file) {
-            editText.setVisibility(GONE);
-            textFileConfig.setVisibility(VISIBLE);
-        } else {
-            editText.setVisibility(VISIBLE);
-            textFileConfig.setVisibility(GONE);
-        }
+        boolean isFile = mRgTextSendBy.getCheckedRadioButtonId() == R.id.rb_text_file;
+        editText.setVisibility(isFile ? GONE : VISIBLE);
+        textFileConfig.setVisibility(isFile ? VISIBLE : GONE);
+        jsonToolsBar.setVisibility(isFile ? GONE : VISIBLE); // file 模式不要格式化和全屏编辑
     }
 
     /**
@@ -881,8 +915,17 @@ public class PacketHelperDialog extends BottomPopupView {
         fileTaskLoop = cbFileLoop.isChecked();
         fileTaskRunning = true;
 
-        tvFileProgress.setText("进度: 0/" + fileLines.size());
+        // 记下来，任务结束后重开面板要还原
+        lastFilePath = path;
+        lastFileDelay = delayStr;
+        lastFileLoop = fileTaskLoop;
+
         Toasts.success(getContext(), "开始发包");
+
+        // 先糊上蒙层和浮窗，再收起面板，任务继续跑
+        showTaskOverlay();
+        fileTaskKeepOnDismiss = true;
+        dismiss();
 
         fileTaskHandler.post(fileTaskRunnable);
     }
@@ -898,11 +941,14 @@ public class PacketHelperDialog extends BottomPopupView {
             try {
                 send_text_msg(fileLines.get(fileTaskIndex), contactCompat);
                 fileTaskIndex++;
-                tvFileProgress.setText("进度: " + fileTaskIndex + "/" + fileLines.size());
+                if (taskStatus != null) {
+                    taskStatus.setText("进度: " + fileTaskIndex + "/" + fileLines.size());
+                }
             } catch (Exception e) {
                 Logger.e("发包失败", e);
                 Toasts.error(getContext(), "发包失败");
                 stopTextFileTask(true);
+                finishTaskOverlay();
                 return;
             }
 
@@ -910,11 +956,15 @@ public class PacketHelperDialog extends BottomPopupView {
                 fileTaskHandler.postDelayed(this, fileTaskDelay);
             } else if (fileTaskLoop) {
                 fileTaskIndex = 0; // 循环模式，发完一轮从头再来
-                tvFileProgress.setText("进度: 0/" + fileLines.size());
+                if (taskStatus != null) {
+                    taskStatus.setText("进度: 0/" + fileLines.size());
+                }
                 fileTaskHandler.postDelayed(this, fileTaskDelay);
             } else {
                 fileTaskRunning = false;
+                fileTaskKeepOnDismiss = false;
                 Toasts.success(getContext(), "发包完成");
+                finishTaskOverlay();
             }
         }
     };
@@ -929,13 +979,223 @@ public class PacketHelperDialog extends BottomPopupView {
         }
 
         fileTaskRunning = false;
+        fileTaskKeepOnDismiss = false;
         fileTaskHandler.removeCallbacks(fileTaskRunnable);
 
-        if (tvFileProgress != null) {
-            tvFileProgress.setText("进度: 已终止 (" + fileTaskIndex + "/" + fileLines.size() + ")");
+        if (taskStatus != null) {
+            taskStatus.setText("进度: 已终止 (" + fileTaskIndex + "/" + fileLines.size() + ")");
         }
 
         if (toast) Toasts.info(getContext(), "已终止");
+    }
+
+    /**
+     * 只在应用内显示的浮窗：黑色 0.3 蒙层 + 右侧居中的卡片，里面是状态和终止
+     */
+    @SuppressLint("InflateParams")
+    private void showTaskOverlay() {
+        if (taskDialog != null) return;
+
+        try {
+            View overlay = LayoutInflater.from(getContext()).inflate(R.layout.layout_task_overlay, null);
+            taskStatus = overlay.findViewById(R.id.tv_task_status);
+            taskStatus.setText("进度: 0/" + fileLines.size());
+
+            overlay.findViewById(R.id.btn_task_stop).setOnClickListener(v -> {
+                stopTextFileTask(true);
+                finishTaskOverlay();
+            });
+
+            Dialog dialog = new Dialog(getContext());
+            dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+            dialog.setContentView(overlay);
+            dialog.setCancelable(false);
+            dialog.setCanceledOnTouchOutside(false);
+
+            Window window = dialog.getWindow();
+            if (window != null) {
+                window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+                window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+                window.setDimAmount(0.3f); // 黑色 0.3 的蒙层
+                window.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+                WindowManager.LayoutParams lp = window.getAttributes();
+                lp.width = WindowManager.LayoutParams.MATCH_PARENT;
+                lp.height = WindowManager.LayoutParams.MATCH_PARENT;
+                window.setAttributes(lp);
+            }
+
+            taskDialog = dialog;
+            dialog.show();
+        } catch (Exception e) {
+            Logger.e("浮窗创建失败", e);
+        }
+    }
+
+    /**
+     * 收掉浮窗，然后把面板重新弹出来
+     */
+    private void finishTaskOverlay() {
+        if (taskDialog != null) {
+            taskDialog.dismiss();
+            taskDialog = null;
+        }
+        taskStatus = null;
+        reopenFileDialog();
+    }
+
+    /**
+     * 重新弹出 PacketHelperDialog，并回到 file 模式
+     */
+    private void reopenFileDialog() {
+        try {
+            reopenFileMode = true;
+            createView(dialogActivity, dialogContext, "");
+        } catch (Exception e) {
+            Logger.e("重开面板失败", e);
+        }
+    }
+
+    /**
+     * 保存的路径管理，和预设一样的一套
+     */
+    @SuppressLint("NotifyDataSetChanged")
+    private void showPresetPathDialog() {
+        MaterialAlertDialogBuilder builder = new MaterialAlertDialogBuilder(getContext());
+        builder.setTitle("保存的路径");
+
+        RecyclerView recyclerView = new RecyclerView(getContext());
+        CustomRecyclerViewAdapter adapter = new CustomRecyclerViewAdapter(presetPaths, item -> {
+            etFilePath.setText(item);
+            path_dialog.dismiss();
+        });
+        recyclerView.setLayoutManager(new LinearLayoutManager(getContext()));
+        recyclerView.setAdapter(adapter);
+
+        ItemTouchHelper itemTouchHelper = new ItemTouchHelper(new ItemTouchHelper.SimpleCallback(ItemTouchHelper.UP | ItemTouchHelper.DOWN, ItemTouchHelper.LEFT | ItemTouchHelper.RIGHT) {
+            @Override
+            public boolean onMove(@NonNull RecyclerView recyclerView, @NonNull RecyclerView.ViewHolder viewHolder, @NonNull RecyclerView.ViewHolder target) {
+                int fromPosition = viewHolder.getAdapterPosition();
+                int toPosition = target.getAdapterPosition();
+
+                String movedItem = presetPaths.remove(fromPosition);
+                presetPaths.add(toPosition, movedItem);
+                adapter.notifyItemMoved(fromPosition, toPosition);
+                savePresetPaths(); // 保存顺序
+                return true;
+            }
+
+            @Override
+            public void onSwiped(@NonNull RecyclerView.ViewHolder viewHolder, int direction) {
+                int position = viewHolder.getAdapterPosition();
+                String deletedItem = presetPaths.get(position);
+
+                new MaterialAlertDialogBuilder(getContext())
+                        .setTitle("确认删除")
+                        .setMessage("你确定要删除路径 " + deletedItem + " 吗？")
+                        .setPositiveButton("确定", (dialog, which) -> {
+                            presetPaths.remove(position);
+                            adapter.notifyItemRemoved(position);
+                            savePresetPaths();
+                            Toasts.success(getContext(), "已删除路径: " + deletedItem);
+                        })
+                        .setNegativeButton("取消", (dialog, which) -> {
+                            adapter.notifyItemChanged(position); // 恢复滑动前的状态
+                            dialog.cancel();
+                        })
+                        .show();
+            }
+
+        });
+        itemTouchHelper.attachToRecyclerView(recyclerView);
+
+        LinearLayout layout = new LinearLayout(getContext());
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.addView(recyclerView);
+
+        builder.setView(layout);
+
+        builder.setNegativeButton("添加", (dialog, which) -> showAddPathDialog(adapter));
+        builder.setNeutralButton("取消", (dialog, which) -> dialog.cancel());
+        path_dialog = builder.show();
+    }
+
+    /**
+     * 添加路径，右边多一个「添加当前」
+     */
+    private void showAddPathDialog(CustomRecyclerViewAdapter adapter) {
+        MaterialAlertDialogBuilder addBuilder = new MaterialAlertDialogBuilder(getContext());
+        addBuilder.setTitle("添加新路径");
+
+        LinearLayout addLayout = new LinearLayout(getContext());
+        addLayout.setOrientation(LinearLayout.VERTICAL);
+
+        EditText inputPath = new EditText(getContext());
+        inputPath.setHint("输入文件路径");
+        addLayout.addView(inputPath);
+
+        addBuilder.setView(addLayout);
+
+        addBuilder.setPositiveButton("确定", (d, w) -> {
+            String newPath = inputPath.getText().toString().trim();
+
+            if (presetPaths.contains(newPath)) {
+                Toasts.error(getContext(), "路径已存在，请使用其他路径");
+                return;
+            }
+
+            if (!newPath.isEmpty()) {
+                presetPaths.add(newPath);
+                savePresetPaths();
+                adapter.notifyDataSetChanged();
+                Toasts.success(getContext(), "已保存路径: " + newPath);
+            } else {
+                Toasts.error(getContext(), "请填写所有字段");
+            }
+        });
+
+        addBuilder.setNegativeButton("取消", (dialog2, which2) -> dialog2.cancel());
+
+        addBuilder.setNeutralButton("添加当前", (d, w) -> {
+            String currentPath = etFilePath.getText().toString().trim();
+
+            if (currentPath.isEmpty()) {
+                Toasts.error(getContext(), "当前没有填路径");
+                return;
+            }
+
+            if (presetPaths.contains(currentPath)) {
+                Toasts.info(getContext(), "这个路径已经保存过了");
+                return;
+            }
+
+            presetPaths.add(currentPath);
+            savePresetPaths();
+            adapter.notifyDataSetChanged();
+            Toasts.success(getContext(), "已保存路径: " + currentPath);
+        });
+
+        addBuilder.show();
+    }
+
+    private void savePresetPaths() {
+        SharedPreferences.Editor editor = pathPreferences.edit();
+        editor.putInt("path_count", presetPaths.size());
+        for (int i = 0; i < presetPaths.size(); i++) {
+            editor.putString("OvO_path_" + i, presetPaths.get(i));
+        }
+        editor.apply();
+    }
+
+    private List<String> loadPresetPaths() {
+        List<String> paths = new ArrayList<>();
+        int count = pathPreferences.getInt("path_count", 0);
+        for (int i = 0; i < count; i++) {
+            String path = pathPreferences.getString("OvO_path_" + i, null);
+            if (path != null) {
+                paths.add(path);
+            }
+        }
+        return paths;
     }
 
     @SuppressLint("SetTextI18n")
@@ -1118,6 +1378,33 @@ public class PacketHelperDialog extends BottomPopupView {
                 }
             });
             addElemDialog.setNegativeButton("取消", (dialog2, which2) -> dialog2.cancel());
+
+            addElemDialog.setNeutralButton("添加当前", (d, w) -> {
+                String currentContent = editText.getText().toString();
+                String newElemName = inputElemName.getText().toString().trim();
+
+                if (currentContent.isEmpty()) {
+                    Toasts.error(getContext(), "当前没有代码");
+                    return;
+                }
+
+                if (newElemName.isEmpty()) {
+                    newElemName = "当前_" + System.currentTimeMillis();
+                }
+
+                if (presetelems.contains(newElemName)) {
+                    Toasts.error(getContext(), "元素名称已存在，请使用其他名称");
+                    return;
+                }
+
+                elemContentMap.put(newElemName, currentContent);
+                presetelems.add(newElemName);
+                savePresetElem();
+                saveElemContentMap();
+                adapter.notifyDataSetChanged();
+                Toasts.success(getContext(), "已保存元素: " + newElemName);
+            });
+
             addElemDialog.show();
         });
 
@@ -1318,7 +1605,7 @@ public class PacketHelperDialog extends BottomPopupView {
 
     @Override
     protected void beforeDismiss() {
-        stopTextFileTask(false); // 面板关掉就把文件任务停掉
+        if (!fileTaskKeepOnDismiss) stopTextFileTask(false); // 面板关掉就把文件任务停掉
         fadeOutAndClearBlur(decorView);
         super.beforeDismiss();
     }
