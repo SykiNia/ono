@@ -4,23 +4,13 @@ import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.database.Cursor
-import android.database.sqlite.SQLiteDatabase
 import android.graphics.Color
-import android.graphics.Typeface
 import android.os.Handler
 import android.os.Looper
-import android.view.ViewGroup
 import android.widget.Button
-import android.widget.FrameLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
-import android.widget.ScrollView
 import android.widget.TextView
-import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import com.tencent.qqnt.kernel.nativeinterface.MsgRecord
-import moe.ono.hooks.protocol.buildMessage
-import moe.ono.util.Utils
 import com.lxj.xpopup.XPopup
 import com.lxj.xpopup.core.BasePopupView
 import com.lxj.xpopup.core.BottomPopupView
@@ -42,7 +32,6 @@ class QQMessageFetcherResultDialog(context: Context) : BottomPopupView(context) 
         Handler(Looper.getMainLooper()).postDelayed({
             val jsonViewer = findViewById<JsonViewer>(R.id.rv_json)
             val btnCopy = findViewById<Button>(R.id.btn_copy)
-            val btnElemHex = findViewById<Button>(R.id.btn_elem_hex)
             val rgType = findViewById<RadioGroup>(R.id.rg_type)
             val tvContent = findViewById<TextView>(R.id.tv_content)
             var copyText: String
@@ -105,14 +94,6 @@ class QQMessageFetcherResultDialog(context: Context) : BottomPopupView(context) 
                 Toasts.info(context, "已复制")
             }
 
-            btnElemHex.setOnClickListener {
-                try {
-                    showElementHexDialog()
-                } catch (e: Exception) {
-                    Toasts.error(context, "导不出来: " + e.message)
-                }
-            }
-
 
         }, 100)
     }
@@ -151,274 +132,6 @@ class QQMessageFetcherResultDialog(context: Context) : BottomPopupView(context) 
 
 
 
-
-    /**
-     * 把当前 pb / MsgRecord 里的元素全部摊成 hex + 字段号
-     * 任何 elementType 都走同一条路，不做类型判断
-     */
-    private fun buildElementHexText(): String {
-        val sb = StringBuilder()
-        val pbJson = content
-
-        // 1. pb 里能重新编码的，直接给真实字节
-        val elemArr = try {
-            pbJson?.optJSONObject("6")?.optJSONObject("3")?.optJSONObject("1")?.optJSONArray("2")
-        } catch (e: Exception) {
-            null
-        }
-
-        if (elemArr != null && elemArr.length() > 0) {
-            sb.append("## 从 pb 重新编码\n")
-            for (i in 0 until elemArr.length()) {
-                val el = elemArr.optJSONObject(i) ?: continue
-                val field = el.keys().asSequence().firstOrNull() ?: "?"
-                val bytes = try {
-                    buildMessage(el.toString())
-                } catch (e: Exception) {
-                    null
-                }
-                sb.append("\n--- element[$i] 字段=").append(field)
-                if (bytes != null) {
-                    sb.append(" 长度=").append(bytes.size).append('\n')
-                    sb.append("HEX: ").append(bytesToHex(bytes)).append('\n')
-                    dumpProto(bytes, sb)
-                } else {
-                    sb.append(" (重新编码失败)\n").append(el.toString()).append('\n')
-                }
-            }
-            sb.append('\n')
-        }
-
-        // 2. MsgRecord：对象没有序列化方法，改从本地库取真实 blob
-        val rec: MsgRecord? = try {
-            CacheConfig.getMsgRecord()
-        } catch (e: Exception) {
-            null
-        }
-
-        if (rec != null) {
-            val records = ArrayList<MsgRecord>()
-            records.add(rec)
-            rec.records?.let { records.addAll(it) }
-
-            records.forEachIndexed { ri, r ->
-                sb.append("\n## MsgRecord[$ri] msgId=").append(r.msgId)
-                    .append(" msgType=").append(r.msgType).append('/').append(r.subMsgType)
-                    .append(" chatType=").append(r.chatType)
-                    .append(" seq=").append(r.msgSeq).append('\n')
-
-                val hits = queryDbBlobs(r.msgId)
-                if (hits.isEmpty()) {
-                    sb.append("(本地库没查到这条的 blob)\n")
-                } else {
-                    hits.forEach { (name, bytes) ->
-                        sb.append("\n--- ").append(name).append(" 长度=").append(bytes.size).append('\n')
-                        sb.append("HEX: ").append(bytesToHex(bytes)).append('\n')
-                        dumpProto(bytes, sb)
-                    }
-                }
-
-                r.elements?.forEachIndexed { i, e ->
-                    sb.append("\n--- element[$i] elementType=").append(e.elementType).append('\n')
-                    sb.append("  grayTip.subElementType=").append(e.grayTipElement?.subElementType).append('\n')
-                    sb.append("  extBufForUI=").append(hexOf(e.extBufForUI)).append('\n')
-                }
-            }
-        }
-
-        if (sb.isEmpty()) sb.append("(没有可用的数据)")
-        return sb.toString()
-    }
-
-    /**
-     * 从 nt_msg.db 里按 msgId 抓 msgContent 之类的大 blob
-     */
-    private fun queryDbBlobs(msgId: Long): List<Pair<String, ByteArray>> {
-        val out = ArrayList<Pair<String, ByteArray>>()
-        val file = context.getDatabasePath("nt_msg.db")
-        if (!file.exists()) return out
-
-        val db: SQLiteDatabase = try {
-            SQLiteDatabase.openDatabase(file.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
-        } catch (e: Exception) {
-            return out
-        }
-
-        try {
-            for (table in arrayOf("c2c_msg_table", "group_msg_table", "guild_msg_table")) {
-                try {
-                    db.rawQuery("SELECT * FROM $table WHERE 40001 = ? LIMIT 1", arrayOf(msgId.toString())).use { c ->
-                        if (c.moveToFirst()) {
-                            for (i in 0 until c.columnCount) {
-                                if (c.getType(i) == Cursor.FIELD_TYPE_BLOB) {
-                                    val b = c.getBlob(i)
-                                    if (b != null && b.size > 16) {
-                                        out.add("$table.${c.getColumnName(i)}" to b)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } catch (_: Exception) {
-                }
-            }
-        } finally {
-            try {
-                db.close()
-            } catch (_: Exception) {
-            }
-        }
-        return out
-    }
-
-    private fun showElementHexDialog() {
-        val text = buildElementHexText()
-
-        val tv = TextView(context).apply {
-            typeface = Typeface.MONOSPACE
-            textSize = 11f
-            setTextIsSelectable(true)
-            setText(text)
-            setPadding(24, 24, 24, 24)
-        }
-
-        val sv = ScrollView(context)
-        sv.addView(tv, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-
-        val container = FrameLayout(context)
-        container.addView(sv, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-
-        val dialog = MaterialAlertDialogBuilder(context)
-            .setTitle("元素字节 / 字段号")
-            .setView(container)
-            .setPositiveButton("复制 HEX", null)
-            .setNeutralButton("复制解析", null)
-            .setNegativeButton("关闭", null)
-            .create()
-
-        dialog.setOnShowListener {
-            val h = (context.resources.displayMetrics.heightPixels * 0.65).toInt()
-            dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, h)
-            dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                copyToClipboard(extractHexLines(text), "已复制 HEX")
-            }
-            dialog.getButton(android.app.AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
-                copyToClipboard(text, "已复制解析")
-            }
-        }
-        dialog.show()
-    }
-
-    private fun extractHexLines(text: String): String {
-        val sb = StringBuilder()
-        text.lineSequence().forEach { line ->
-            if (line.startsWith("HEX: ")) sb.append(line.removePrefix("HEX: ")).append('\n')
-        }
-        return if (sb.isEmpty()) text else sb.toString()
-    }
-
-    private fun copyToClipboard(text: String, toast: String) {
-        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        cm.setPrimaryClip(ClipData.newPlainText("ono", text))
-        Toasts.info(context, toast)
-    }
-
-    private fun hexOf(b: ByteArray?): String =
-        if (b == null) "null" else if (b.size <= 32) bytesToHex(b) else bytesToHex(b.copyOfRange(0, 32)) + "..."
-
-    private fun bytesToHex(b: ByteArray): String =
-        Utils.bytesToHex(b)
-
-    /**
-     * protobuf 无 schema 解析，只按 tag 编号打印，正好用来读字段号
-     */
-    private fun dumpProto(b: ByteArray, sb: StringBuilder, depth: Int = 0, path: String = ""): Boolean {
-        var i = 0
-        var fields = 0
-        val pad = "    ".repeat(depth)
-        while (i < b.size) {
-            val t = readVarint(b, i) ?: return false
-            val key = t.first
-            i = t.second
-            val field = (key ushr 3).toInt()
-            val wire = (key and 7L).toInt()
-            if (field <= 0) return false
-
-            when (wire) {
-                0 -> {
-                    val v = readVarint(b, i) ?: return false
-                    i = v.second
-                    sb.append(pad).append(path).append(field).append(": ").append(v.first).append('\n')
-                }
-                1 -> {
-                    if (i + 8 > b.size) return false
-                    sb.append(pad).append(path).append(field).append(": fixed64 ")
-                        .append(bytesToHex(b.copyOfRange(i, i + 8))).append('\n')
-                    i += 8
-                }
-                5 -> {
-                    if (i + 4 > b.size) return false
-                    sb.append(pad).append(path).append(field).append(": fixed32 ")
-                        .append(bytesToHex(b.copyOfRange(i, i + 4))).append('\n')
-                    i += 4
-                }
-                2 -> {
-                    val l = readVarint(b, i) ?: return false
-                    i = l.second
-                    val len = l.first.toInt()
-                    if (len < 0 || i + len > b.size) return false
-                    val v = b.copyOfRange(i, i + len)
-                    i += len
-
-                    val sub = StringBuilder()
-                    var parsed = false
-                    if (len > 0) {
-                        parsed = try {
-                            dumpProto(v, sub, depth + 1, "$path$field.")
-                        } catch (e: Exception) {
-                            false
-                        }
-                    }
-
-                    if (parsed) {
-                        sb.append(pad).append(path).append(field).append(" { ").append(len).append("B\n")
-                        sb.append(sub).append(pad).append("}\n")
-                    } else {
-                        val str = String(v, Charsets.UTF_8)
-                        val printable = v.isNotEmpty() && str.all { c ->
-                            c == '\n' || c == '\r' || c == '\t' || c.code in 0x20..0x7E || c.code > 0x7F
-                        }
-                        if (printable) {
-                            sb.append(pad).append(path).append(field).append(": \"")
-                                .append(str.replace("\"", "\\\"")).append("\"\n")
-                        } else {
-                            sb.append(pad).append(path).append(field).append(": ")
-                                .append(if (v.size <= 48) bytesToHex(v) else bytesToHex(v.copyOfRange(0, 48)) + "...")
-                                .append('\n')
-                        }
-                    }
-                }
-                else -> return false
-            }
-            fields++
-        }
-        return fields > 0
-    }
-
-    private fun readVarint(b: ByteArray, start: Int): Pair<Long, Int>? {
-        var res = 0L
-        var shift = 0
-        var i = start
-        while (i < b.size) {
-            val v = b[i].toInt() and 0xFF
-            res = res or ((v and 0x7F).toLong() shl shift)
-            i++
-            if (v and 0x80 == 0) return res to i
-            shift += 7
-            if (shift > 63) return null
-        }
-        return null
-    }
 
     override fun getImplLayoutId(): Int {
         return R.layout.layout_qq_message_fetcher_result

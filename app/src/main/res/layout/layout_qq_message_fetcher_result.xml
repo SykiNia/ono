@@ -104,20 +104,6 @@
                             />
 
 
-                        <com.google.android.material.button.MaterialButton
-                            android:id="@+id/btn_elem_hex"
-                            android:layout_width="match_parent"
-                            android:layout_height="wrap_content"
-                            android:text="元素字节 / 字段号"
-                            android:textStyle="bold"
-                            app:cornerRadius="25dp"
-                            android:backgroundTint="#37FFFFFF"
-                            android:textColor="@color/firstTextColor"
-                            android:layout_marginLeft="10dp"
-                            android:layout_marginRight="10dp"
-                            android:layout_marginTop="10dp"
-                            />
-
                         <moe.ono.ui.view.JsonViewer
                             android:id="@+id/rv_json"
                             android:layout_width="match_parent"
