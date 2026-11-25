@@ -18,7 +18,6 @@ import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import com.tencent.qqnt.kernel.nativeinterface.MsgRecord
 import moe.ono.hooks.protocol.buildMessage
 import moe.ono.util.Utils
 import com.lxj.xpopup.XPopup
@@ -190,24 +189,27 @@ class QQMessageFetcherResultDialog(context: Context) : BottomPopupView(context) 
         }
 
         // 2. MsgRecord：对象没有序列化方法，改从本地库取真实 blob
-        val rec: MsgRecord? = try {
+        //    所有 getter 都走反射，不同 QQ 版本删方法也不会崩
+        val rec: Any? = try {
             CacheConfig.getMsgRecord()
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             null
         }
 
         if (rec != null) {
-            val records = ArrayList<MsgRecord>()
+            val records = ArrayList<Any?>()
             records.add(rec)
-            rec.records?.let { records.addAll(it) }
+            callList(rec, "getRecords").forEach { records.add(it) }
 
             records.forEachIndexed { ri, r ->
-                sb.append("\n## MsgRecord[$ri] msgId=").append(r.msgId)
-                    .append(" msgType=").append(r.msgType).append('/').append(r.subMsgType)
-                    .append(" chatType=").append(r.chatType)
-                    .append(" seq=").append(r.msgSeq).append('\n')
+                val msgId = callLong(r, "getMsgId")
+                sb.append("\n## MsgRecord[").append(ri).append("] msgId=").append(msgId)
+                    .append(" msgType=").append(callInt(r, "getMsgType"))
+                    .append('/').append(callInt(r, "getSubMsgType"))
+                    .append(" chatType=").append(callInt(r, "getChatType"))
+                    .append(" seq=").append(callLong(r, "getMsgSeq")).append('\n')
 
-                val hits = queryDbBlobs(r.msgId)
+                val hits = queryDbBlobs(msgId)
                 if (hits.isEmpty()) {
                     sb.append("(本地库没查到这条的 blob)\n")
                 } else {
@@ -218,10 +220,16 @@ class QQMessageFetcherResultDialog(context: Context) : BottomPopupView(context) 
                     }
                 }
 
-                r.elements?.forEachIndexed { i, e ->
-                    sb.append("\n--- element[$i] elementType=").append(e.elementType).append('\n')
-                    sb.append("  grayTip.subElementType=").append(e.grayTipElement?.subElementType).append('\n')
-                    sb.append("  extBufForUI=").append(hexOf(e.extBufForUI)).append('\n')
+                callList(r, "getElements").forEachIndexed { i, e ->
+                    sb.append("\n--- element[").append(i).append("] elementType=")
+                        .append(callInt(e, "getElementType")).append('\n')
+
+                    val grayTip = callObj(e, "getGrayTipElement")
+                    if (grayTip != null) {
+                        sb.append("  grayTip.subElementType=")
+                            .append(callInt(grayTip, "getSubElementType")).append('\n')
+                    }
+                    sb.append("  extBufForUI=").append(hexOf(callBytes(e, "getExtBufForUI"))).append('\n')
                 }
             }
         }
@@ -322,6 +330,30 @@ class QQMessageFetcherResultDialog(context: Context) : BottomPopupView(context) 
         cm.setPrimaryClip(ClipData.newPlainText("ono", text))
         Toasts.info(context, toast)
     }
+
+    /* ---- 反射取值：QQ 各版本 getter 增删都不影响 ---- */
+
+    private fun callObj(obj: Any?, name: String): Any? = try {
+        if (obj == null) null else obj.javaClass.getMethod(name).invoke(obj)
+    } catch (e: Throwable) {
+        null
+    }
+
+    private fun callInt(obj: Any?, name: String): Int =
+        (callObj(obj, name) as? Int) ?: 0
+
+    private fun callLong(obj: Any?, name: String): Long = when (val v = callObj(obj, name)) {
+        is Long -> v
+        is Int -> v.toLong()
+        is Number -> v.toLong()
+        else -> 0L
+    }
+
+    private fun callBytes(obj: Any?, name: String): ByteArray? =
+        callObj(obj, name) as? ByteArray
+
+    private fun callList(obj: Any?, name: String): List<Any?> =
+        (callObj(obj, name) as? List<*>)?.map { it } ?: emptyList()
 
     private fun hexOf(b: ByteArray?): String =
         if (b == null) "null" else if (b.size <= 32) bytesToHex(b) else bytesToHex(b.copyOfRange(0, 32)) + "..."
